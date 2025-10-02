@@ -1,0 +1,186 @@
+#!/usr/bin/env groovy
+/**
+ * VCNNGR Minideb Pipeline
+ * 
+ * Build base image Debian minimal
+ * Trigger: Manual, Scheduled, o da nuova Debian stable release
+ */
+
+pipeline {
+    agent {
+        kubernetes {
+            yaml """
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+  - name: docker
+    image: docker:24.0.9-dind
+    securityContext:
+      privileged: true
+    env:
+    - name: DOCKER_TLS_CERTDIR
+      value: ""
+    volumeMounts:
+    - name: docker-storage
+      mountPath: /var/lib/docker
+  - name: trivy
+    image: aquasec/trivy:latest
+    command:
+    - cat
+    tty: true
+  volumes:
+  - name: docker-storage
+    emptyDir: {}
+"""
+        }
+    }
+    
+    parameters {
+        string(name: 'DEBIAN_VERSION', defaultValue: 'bookworm', description: 'Debian codename (bookworm, bullseye, etc)')
+        string(name: 'DEBIAN_RELEASE', defaultValue: '12', description: 'Debian major version')
+        booleanParam(name: 'SKIP_SCAN', defaultValue: false, description: 'Skip security scan')
+    }
+    
+    environment {
+        DOCKERHUB_CREDENTIALS = credentials('dockerhub-credentials')
+        DOCKERHUB_USER = 'vcnngr'
+        IMAGE_NAME = "${DOCKERHUB_USER}/minideb"
+        BUILD_DATE = sh(returnStdout: true, script: 'date -u +"%Y-%m-%dT%H:%M:%SZ"').trim()
+    }
+    
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        timeout(time: 30, unit: 'MINUTES')
+        timestamps()
+    }
+    
+    stages {
+        stage('Check Existing Image') {
+            steps {
+                container('docker') {
+                    script {
+                        sh 'timeout 30 sh -c "until docker info; do sleep 1; done"'
+                        
+                        def imageExists = sh(
+                            returnStatus: true,
+                            script: "docker manifest inspect ${IMAGE_NAME}:${params.DEBIAN_VERSION} > /dev/null 2>&1"
+                        )
+                        
+                        if (imageExists == 0) {
+                            echo "Image ${IMAGE_NAME}:${params.DEBIAN_VERSION} exists"
+                            env.FORCE_REBUILD = input(
+                                message: 'Image already exists. Force rebuild?',
+                                parameters: [booleanParam(defaultValue: false, name: 'Rebuild')]
+                            ).toString()
+                        } else {
+                            env.FORCE_REBUILD = 'true'
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Build Minideb') {
+            when {
+                expression { env.FORCE_REBUILD == 'true' }
+            }
+            steps {
+                container('docker') {
+                    script {
+                        echo "Building VCNNGR Minideb ${params.DEBIAN_VERSION}"
+                        
+                        sh """
+                            cd docker/minideb
+                            
+                            docker build \
+                                --tag ${IMAGE_NAME}:${params.DEBIAN_VERSION} \
+                                --tag ${IMAGE_NAME}:${params.DEBIAN_RELEASE} \
+                                --tag ${IMAGE_NAME}:latest \
+                                --label "org.opencontainers.image.created=${BUILD_DATE}" \
+                                --label "org.opencontainers.image.revision=${GIT_COMMIT}" \
+                                --label "org.opencontainers.image.version=${params.DEBIAN_VERSION}" \
+                                --label "org.opencontainers.image.source=https://github.com/vcnngr/wordpress-mariadb-stack" \
+                                .
+                        """
+                    }
+                }
+            }
+        }
+        
+        stage('Security Scan') {
+            when {
+                allOf {
+                    expression { env.FORCE_REBUILD == 'true' }
+                    expression { params.SKIP_SCAN == false }
+                }
+            }
+            steps {
+                container('trivy') {
+                    script {
+                        sh """
+                            trivy image \
+                                --severity HIGH,CRITICAL \
+                                --exit-code 0 \
+                                --format json \
+                                --output minideb-scan.json \
+                                ${IMAGE_NAME}:${params.DEBIAN_VERSION}
+                        """
+                        
+                        archiveArtifacts artifacts: 'minideb-scan.json', allowEmptyArchive: true
+                    }
+                }
+            }
+        }
+        
+        stage('Push to Docker Hub') {
+            when {
+                allOf {
+                    expression { env.FORCE_REBUILD == 'true' }
+                    branch 'main'
+                }
+            }
+            steps {
+                container('docker') {
+                    script {
+                        sh '''
+                            echo $DOCKERHUB_CREDENTIALS_PSW | docker login -u $DOCKERHUB_CREDENTIALS_USR --password-stdin
+                            
+                            docker push ${IMAGE_NAME}:${DEBIAN_VERSION}
+                            docker push ${IMAGE_NAME}:${DEBIAN_RELEASE}
+                            docker push ${IMAGE_NAME}:latest
+                            
+                            docker logout
+                        '''
+                    }
+                }
+            }
+        }
+        
+        stage('Trigger WordPress Build') {
+            when {
+                allOf {
+                    expression { env.FORCE_REBUILD == 'true' }
+                    branch 'main'
+                }
+            }
+            steps {
+                build job: 'wordpress-pipeline', wait: false
+            }
+        }
+    }
+    
+    post {
+        always {
+            container('docker') {
+                sh 'docker logout || true'
+            }
+        }
+        success {
+            echo "Minideb ${params.DEBIAN_VERSION} built and published successfully"
+        }
+        failure {
+            echo "Minideb build failed"
+        }
+    }
+}
