@@ -295,9 +295,10 @@ spec:
             when {
                 allOf {
                     expression { env.SKIP_BUILD != 'true' || params.FORCE_BUILD == true }
-                    anyOf {
-                        branch 'main'
-                        branch 'master'
+                    expression { 
+                        // Verifica più robusta del branch
+                        def currentBranch = env.GIT_BRANCH ?: env.BRANCH_NAME ?: ''
+                        return currentBranch.contains('main') || currentBranch.contains('master')
                     }
                 }
             }
@@ -314,8 +315,6 @@ spec:
                             docker push ${IMAGE_NAME}:latest
                             
                             echo "Images pushed successfully ✓"
-                            
-                            docker logout
                         """
                     }
                 }
