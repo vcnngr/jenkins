@@ -3,6 +3,16 @@
  * VCNNGR Minideb Pipeline
  * 
  * Build base image Debian minimal con ultime patch di sicurezza
+ * 
+ * Trigger: 
+ * - Manual
+ * - Scheduled (weekly)
+ * - Webhook da Debian security announce
+ * 
+ * Output:
+ * - vcnngr/minideb:bookworm
+ * - vcnngr/minideb:12
+ * - vcnngr/minideb:latest
  */
 
 pipeline {
@@ -54,12 +64,28 @@ spec:
         booleanParam(name: 'FORCE_BUILD', defaultValue: false, description: 'Force rebuild even if image exists')
     }
     
+    // ========== CONFIGURAZIONE CRON ==========
+    triggers {
+        // Esegui ogni domenica alle 02:00
+        cron('0 2 * * 0')
+        
+        // ALTRI ESEMPI:
+        // Ogni giorno alle 03:00: cron('0 3 * * *')
+        // Ogni lunedì alle 04:00: cron('0 4 * * 1')
+        // Primo del mese alle 05:00: cron('0 5 1 * *')
+        // Ogni 6 ore: cron('0 */6 * * *')
+    }
+    
     environment {
         DOCKERHUB_CREDENTIALS = credentials('dockerhub-credentials')
         DOCKERHUB_USER = 'vcnngr'
         IMAGE_NAME = "${DOCKERHUB_USER}/minideb"
         BUILD_DATE = sh(returnStdout: true, script: 'date -u +"%Y-%m-%dT%H:%M:%SZ"').trim()
         GIT_COMMIT_SHORT = sh(returnStdout: true, script: 'git rev-parse --short HEAD').trim()
+        
+        // ========== CONFIGURAZIONE EMAIL ==========
+        // MODIFICA QUESTO CON LA TUA EMAIL
+        NOTIFICATION_EMAIL = 'vingrosso@gmail.com'
     }
     
     options {
@@ -208,15 +234,29 @@ spec:
                         if (scanResult.Results) {
                             def criticalCount = 0
                             def highCount = 0
+                            def mediumCount = 0
+                            def lowCount = 0
+                            
                             scanResult.Results.each { result ->
                                 result.Vulnerabilities?.each { vuln ->
                                     if (vuln.Severity == 'CRITICAL') criticalCount++
                                     if (vuln.Severity == 'HIGH') highCount++
+                                    if (vuln.Severity == 'MEDIUM') mediumCount++
+                                    if (vuln.Severity == 'LOW') lowCount++
                                 }
                             }
+                            
+                            // Store counts as environment variables
+                            env.VULN_CRITICAL = criticalCount.toString()
+                            env.VULN_HIGH = highCount.toString()
+                            env.VULN_MEDIUM = mediumCount.toString()
+                            env.VULN_LOW = lowCount.toString()
+                            
                             echo "Security Scan Summary:"
                             echo "  - CRITICAL: ${criticalCount}"
                             echo "  - HIGH: ${highCount}"
+                            echo "  - MEDIUM: ${mediumCount}"
+                            echo "  - LOW: ${lowCount}"
                             
                             if (criticalCount > 0) {
                                 unstable("Found ${criticalCount} CRITICAL vulnerabilities")
@@ -307,12 +347,14 @@ spec:
         }
     }
     
+    // ========== NOTIFICHE E POST-BUILD ==========
     post {
         always {
             container('docker') {
                 sh 'docker logout || true'
             }
         }
+        
         success {
             script {
                 if (env.SKIP_BUILD == 'true' && params.FORCE_BUILD == false) {
@@ -323,14 +365,155 @@ spec:
                     echo "  - ${IMAGE_NAME}:${params.DEBIAN_VERSION}"
                     echo "  - ${IMAGE_NAME}:${params.DEBIAN_RELEASE}"
                     echo "  - ${IMAGE_NAME}:latest"
+                    
+                    // ========== EMAIL DI SUCCESSO ==========
+                    emailext (
+                        subject: "✓ Minideb Build Success - ${params.DEBIAN_VERSION}",
+                        body: """
+                            <html>
+                            <body style="font-family: Arial, sans-serif;">
+                                <h2 style="color: #28a745;">Minideb Build Completed Successfully</h2>
+                                
+                                <h3>Build Information</h3>
+                                <table style="border-collapse: collapse;">
+                                    <tr><td style="padding: 5px;"><strong>Image:</strong></td><td style="padding: 5px;">${IMAGE_NAME}:${params.DEBIAN_VERSION}</td></tr>
+                                    <tr><td style="padding: 5px;"><strong>Build Date:</strong></td><td style="padding: 5px;">${BUILD_DATE}</td></tr>
+                                    <tr><td style="padding: 5px;"><strong>Git Commit:</strong></td><td style="padding: 5px;">${GIT_COMMIT_SHORT}</td></tr>
+                                    <tr><td style="padding: 5px;"><strong>Build URL:</strong></td><td style="padding: 5px;"><a href="${env.BUILD_URL}">${env.BUILD_URL}</a></td></tr>
+                                </table>
+                                
+                                <h3>Security Scan Results</h3>
+                                <table style="border-collapse: collapse; border: 1px solid #ddd;">
+                                    <tr style="background-color: #f2f2f2;">
+                                        <th style="padding: 8px; border: 1px solid #ddd;">Severity</th>
+                                        <th style="padding: 8px; border: 1px solid #ddd;">Count</th>
+                                    </tr>
+                                    <tr>
+                                        <td style="padding: 8px; border: 1px solid #ddd; color: #dc3545;">CRITICAL</td>
+                                        <td style="padding: 8px; border: 1px solid #ddd;">${env.VULN_CRITICAL ?: '0'}</td>
+                                    </tr>
+                                    <tr>
+                                        <td style="padding: 8px; border: 1px solid #ddd; color: #fd7e14;">HIGH</td>
+                                        <td style="padding: 8px; border: 1px solid #ddd;">${env.VULN_HIGH ?: '0'}</td>
+                                    </tr>
+                                    <tr>
+                                        <td style="padding: 8px; border: 1px solid #ddd; color: #ffc107;">MEDIUM</td>
+                                        <td style="padding: 8px; border: 1px solid #ddd;">${env.VULN_MEDIUM ?: '0'}</td>
+                                    </tr>
+                                    <tr>
+                                        <td style="padding: 8px; border: 1px solid #ddd; color: #6c757d;">LOW</td>
+                                        <td style="padding: 8px; border: 1px solid #ddd;">${env.VULN_LOW ?: '0'}</td>
+                                    </tr>
+                                </table>
+                                
+                                <p><em>Detailed reports are attached to this email.</em></p>
+                                
+                                <h3>Available Images</h3>
+                                <ul>
+                                    <li><code>${IMAGE_NAME}:${params.DEBIAN_VERSION}</code></li>
+                                    <li><code>${IMAGE_NAME}:${params.DEBIAN_RELEASE}</code></li>
+                                    <li><code>${IMAGE_NAME}:latest</code></li>
+                                </ul>
+                                
+                                <hr>
+                                <p style="font-size: 12px; color: #666;">
+                                    This is an automated message from Jenkins.<br>
+                                    Job: ${env.JOB_NAME} | Build: #${env.BUILD_NUMBER}
+                                </p>
+                            </body>
+                            </html>
+                        """,
+                        to: "${NOTIFICATION_EMAIL}",
+                        mimeType: 'text/html',
+                        attachmentsPattern: 'minideb-scan.*'
+                    )
                 }
             }
         }
+        
         failure {
             echo "✗ Minideb pipeline failed"
+            
+            // ========== EMAIL DI ERRORE ==========
+            emailext (
+                subject: "✗ Minideb Build Failed - ${params.DEBIAN_VERSION}",
+                body: """
+                    <html>
+                    <body style="font-family: Arial, sans-serif;">
+                        <h2 style="color: #dc3545;">Minideb Build Failed</h2>
+                        
+                        <h3>Build Information</h3>
+                        <table style="border-collapse: collapse;">
+                            <tr><td style="padding: 5px;"><strong>Image:</strong></td><td style="padding: 5px;">${IMAGE_NAME}:${params.DEBIAN_VERSION}</td></tr>
+                            <tr><td style="padding: 5px;"><strong>Build Date:</strong></td><td style="padding: 5px;">${BUILD_DATE}</td></tr>
+                            <tr><td style="padding: 5px;"><strong>Git Commit:</strong></td><td style="padding: 5px;">${GIT_COMMIT_SHORT}</td></tr>
+                            <tr><td style="padding: 5px;"><strong>Build URL:</strong></td><td style="padding: 5px;"><a href="${env.BUILD_URL}">${env.BUILD_URL}</a></td></tr>
+                            <tr><td style="padding: 5px;"><strong>Console:</strong></td><td style="padding: 5px;"><a href="${env.BUILD_URL}console">${env.BUILD_URL}console</a></td></tr>
+                        </table>
+                        
+                        <p style="color: #dc3545;"><strong>Action Required:</strong> Check the console output for error details.</p>
+                        
+                        <hr>
+                        <p style="font-size: 12px; color: #666;">
+                            This is an automated message from Jenkins.<br>
+                            Job: ${env.JOB_NAME} | Build: #${env.BUILD_NUMBER}
+                        </p>
+                    </body>
+                    </html>
+                """,
+                to: "${NOTIFICATION_EMAIL}",
+                mimeType: 'text/html'
+            )
         }
+        
         unstable {
             echo "⚠ Minideb pipeline unstable - check security scan results"
+            
+            // ========== EMAIL PER VULNERABILITA' CRITICHE ==========
+            emailext (
+                subject: "⚠ Minideb Build Unstable - Critical Vulnerabilities Found",
+                body: """
+                    <html>
+                    <body style="font-family: Arial, sans-serif;">
+                        <h2 style="color: #ffc107;">Minideb Build Completed with Warnings</h2>
+                        
+                        <h3>Build Information</h3>
+                        <table style="border-collapse: collapse;">
+                            <tr><td style="padding: 5px;"><strong>Image:</strong></td><td style="padding: 5px;">${IMAGE_NAME}:${params.DEBIAN_VERSION}</td></tr>
+                            <tr><td style="padding: 5px;"><strong>Build Date:</strong></td><td style="padding: 5px;">${BUILD_DATE}</td></tr>
+                            <tr><td style="padding: 5px;"><strong>Build URL:</strong></td><td style="padding: 5px;"><a href="${env.BUILD_URL}">${env.BUILD_URL}</a></td></tr>
+                        </table>
+                        
+                        <h3 style="color: #dc3545;">⚠ Critical Security Vulnerabilities Detected</h3>
+                        <table style="border-collapse: collapse; border: 1px solid #ddd;">
+                            <tr style="background-color: #f2f2f2;">
+                                <th style="padding: 8px; border: 1px solid #ddd;">Severity</th>
+                                <th style="padding: 8px; border: 1px solid #ddd;">Count</th>
+                            </tr>
+                            <tr>
+                                <td style="padding: 8px; border: 1px solid #ddd; color: #dc3545;">CRITICAL</td>
+                                <td style="padding: 8px; border: 1px solid #ddd;"><strong>${env.VULN_CRITICAL ?: '0'}</strong></td>
+                            </tr>
+                            <tr>
+                                <td style="padding: 8px; border: 1px solid #ddd; color: #fd7e14;">HIGH</td>
+                                <td style="padding: 8px; border: 1px solid #ddd;"><strong>${env.VULN_HIGH ?: '0'}</strong></td>
+                            </tr>
+                        </table>
+                        
+                        <p style="color: #dc3545;"><strong>Action Required:</strong> Review the attached security scan reports immediately.</p>
+                        
+                        <hr>
+                        <p style="font-size: 12px; color: #666;">
+                            This is an automated message from Jenkins.<br>
+                            Job: ${env.JOB_NAME} | Build: #${env.BUILD_NUMBER}
+                        </p>
+                    </body>
+                    </html>
+                """,
+                to: "${NOTIFICATION_EMAIL}",
+                mimeType: 'text/html',
+                attachmentsPattern: 'minideb-scan.*'
+            )
         }
     }
 }
