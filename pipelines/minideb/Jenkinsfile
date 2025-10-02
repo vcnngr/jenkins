@@ -2,8 +2,17 @@
 /**
  * VCNNGR Minideb Pipeline
  * 
- * Build base image Debian minimal
- * Trigger: Manual, Scheduled, o da nuova Debian stable release
+ * Build base image Debian minimal con ultime patch di sicurezza
+ * 
+ * Trigger: 
+ * - Manual
+ * - Scheduled (weekly)
+ * - Webhook da Debian security announce
+ * 
+ * Output:
+ * - vcnngr/minideb:bookworm
+ * - vcnngr/minideb:12
+ * - vcnngr/minideb:latest
  */
 
 pipeline {
@@ -37,9 +46,10 @@ spec:
     }
     
     parameters {
-        string(name: 'DEBIAN_VERSION', defaultValue: 'bookworm', description: 'Debian codename (bookworm, bullseye, etc)')
+        string(name: 'DEBIAN_VERSION', defaultValue: 'bookworm', description: 'Debian codename')
         string(name: 'DEBIAN_RELEASE', defaultValue: '12', description: 'Debian major version')
         booleanParam(name: 'SKIP_SCAN', defaultValue: false, description: 'Skip security scan')
+        booleanParam(name: 'FORCE_BUILD', defaultValue: false, description: 'Force rebuild even if image exists')
     }
     
     environment {
@@ -47,34 +57,49 @@ spec:
         DOCKERHUB_USER = 'vcnngr'
         IMAGE_NAME = "${DOCKERHUB_USER}/minideb"
         BUILD_DATE = sh(returnStdout: true, script: 'date -u +"%Y-%m-%dT%H:%M:%SZ"').trim()
+        GIT_COMMIT_SHORT = sh(returnStdout: true, script: 'git rev-parse --short HEAD').trim()
     }
     
     options {
-        buildDiscarder(logRotator(numToKeepStr: '10'))
-        timeout(time: 30, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+        timeout(time: 45, unit: 'MINUTES')
         timestamps()
+        ansiColor('xterm')
     }
     
     stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+        
         stage('Check Existing Image') {
+            when {
+                expression { params.FORCE_BUILD == false }
+            }
             steps {
                 container('docker') {
                     script {
+                        echo "Checking if image ${IMAGE_NAME}:${params.DEBIAN_VERSION} exists on Docker Hub..."
+                        
                         sh 'timeout 30 sh -c "until docker info; do sleep 1; done"'
                         
                         def imageExists = sh(
                             returnStatus: true,
-                            script: "docker manifest inspect ${IMAGE_NAME}:${params.DEBIAN_VERSION} > /dev/null 2>&1"
+                            script: """
+                                curl -s -o /dev/null -w "%{http_code}" \
+                                https://hub.docker.com/v2/repositories/${IMAGE_NAME}/tags/${params.DEBIAN_VERSION} | \
+                                grep -q 200
+                            """
                         )
                         
                         if (imageExists == 0) {
-                            echo "Image ${IMAGE_NAME}:${params.DEBIAN_VERSION} exists"
-                            env.FORCE_REBUILD = input(
-                                message: 'Image already exists. Force rebuild?',
-                                parameters: [booleanParam(defaultValue: false, name: 'Rebuild')]
-                            ).toString()
+                            echo "Image already exists on Docker Hub"
+                            env.SKIP_BUILD = 'true'
                         } else {
-                            env.FORCE_REBUILD = 'true'
+                            echo "Image does not exist, will build"
+                            env.SKIP_BUILD = 'false'
                         }
                     }
                 }
@@ -83,25 +108,34 @@ spec:
         
         stage('Build Minideb') {
             when {
-                expression { env.FORCE_REBUILD == 'true' }
+                expression { env.SKIP_BUILD != 'true' || params.FORCE_BUILD == true }
             }
             steps {
                 container('docker') {
                     script {
-                        echo "Building VCNNGR Minideb ${params.DEBIAN_VERSION}"
+                        echo "Building VCNNGR Minideb ${params.DEBIAN_VERSION} with latest security patches"
                         
                         sh """
                             cd docker/minideb
                             
                             docker build \
+                                --no-cache \
+                                --pull \
                                 --tag ${IMAGE_NAME}:${params.DEBIAN_VERSION} \
                                 --tag ${IMAGE_NAME}:${params.DEBIAN_RELEASE} \
                                 --tag ${IMAGE_NAME}:latest \
                                 --label "org.opencontainers.image.created=${BUILD_DATE}" \
-                                --label "org.opencontainers.image.revision=${GIT_COMMIT}" \
+                                --label "org.opencontainers.image.revision=${GIT_COMMIT_SHORT}" \
                                 --label "org.opencontainers.image.version=${params.DEBIAN_VERSION}" \
-                                --label "org.opencontainers.image.source=https://github.com/vcnngr/wordpress-mariadb-stack" \
+                                --label "org.opencontainers.image.title=minideb" \
+                                --label "org.opencontainers.image.description=Minimal Debian base image by VCNNGR" \
+                                --label "org.opencontainers.image.vendor=VCNNGR" \
+                                --label "org.opencontainers.image.source=https://github.com/vcnngr/" \
+                                --label "org.opencontainers.image.licenses=MIT" \
                                 .
+                            
+                            echo "Build completed successfully"
+                            docker images | grep minideb
                         """
                     }
                 }
@@ -111,23 +145,67 @@ spec:
         stage('Security Scan') {
             when {
                 allOf {
-                    expression { env.FORCE_REBUILD == 'true' }
+                    expression { env.SKIP_BUILD != 'true' || params.FORCE_BUILD == true }
                     expression { params.SKIP_SCAN == false }
                 }
             }
             steps {
                 container('trivy') {
                     script {
+                        echo "Running security scan with Trivy..."
+                        
                         sh """
+                            # Scan for vulnerabilities
                             trivy image \
                                 --severity HIGH,CRITICAL \
                                 --exit-code 0 \
                                 --format json \
                                 --output minideb-scan.json \
                                 ${IMAGE_NAME}:${params.DEBIAN_VERSION}
+                            
+                            # Generate human-readable report
+                            trivy image \
+                                --severity HIGH,CRITICAL,MEDIUM,LOW \
+                                --format table \
+                                ${IMAGE_NAME}:${params.DEBIAN_VERSION} | tee minideb-scan.txt
                         """
                         
-                        archiveArtifacts artifacts: 'minideb-scan.json', allowEmptyArchive: true
+                        archiveArtifacts artifacts: 'minideb-scan.*', allowEmptyArchive: true
+                        
+                        // Parse scan results
+                        def scanResult = readJSON file: 'minideb-scan.json'
+                        if (scanResult.Results) {
+                            def vulnCount = 0
+                            scanResult.Results.each { result ->
+                                vulnCount += result.Vulnerabilities?.size() ?: 0
+                            }
+                            echo "Found ${vulnCount} total vulnerabilities"
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Test Image') {
+            when {
+                expression { env.SKIP_BUILD != 'true' || params.FORCE_BUILD == true }
+            }
+            steps {
+                container('docker') {
+                    script {
+                        echo "Testing minideb image..."
+                        
+                        sh """
+                            # Test basic functionality
+                            docker run --rm ${IMAGE_NAME}:${params.DEBIAN_VERSION} bash -c '
+                                echo "Testing minideb image..."
+                                which install_packages || exit 1
+                                which gosu || exit 1
+                                which curl || exit 1
+                                apt-get update > /dev/null
+                                echo "All tests passed"
+                            '
+                        """
                     }
                 }
             }
@@ -136,36 +214,54 @@ spec:
         stage('Push to Docker Hub') {
             when {
                 allOf {
-                    expression { env.FORCE_REBUILD == 'true' }
-                    branch 'main'
+                    expression { env.SKIP_BUILD != 'true' || params.FORCE_BUILD == true }
+                    anyOf {
+                        branch 'main'
+                        branch 'master'
+                    }
                 }
             }
             steps {
                 container('docker') {
                     script {
-                        sh '''
-                            echo $DOCKERHUB_CREDENTIALS_PSW | docker login -u $DOCKERHUB_CREDENTIALS_USR --password-stdin
+                        echo "Pushing images to Docker Hub..."
+                        
+                        sh """
+                            echo \$DOCKERHUB_CREDENTIALS_PSW | docker login -u \$DOCKERHUB_CREDENTIALS_USR --password-stdin
                             
-                            docker push ${IMAGE_NAME}:${DEBIAN_VERSION}
-                            docker push ${IMAGE_NAME}:${DEBIAN_RELEASE}
+                            # Push all tags
+                            docker push ${IMAGE_NAME}:${params.DEBIAN_VERSION}
+                            docker push ${IMAGE_NAME}:${params.DEBIAN_RELEASE}
                             docker push ${IMAGE_NAME}:latest
                             
+                            echo "Images pushed successfully"
+                            
                             docker logout
-                        '''
+                        """
                     }
                 }
             }
         }
         
-        stage('Trigger WordPress Build') {
+        stage('Create Release Tag') {
             when {
                 allOf {
-                    expression { env.FORCE_REBUILD == 'true' }
-                    branch 'main'
+                    expression { env.SKIP_BUILD != 'true' || params.FORCE_BUILD == true }
+                    anyOf {
+                        branch 'main'
+                        branch 'master'
+                    }
                 }
             }
             steps {
-                build job: 'wordpress-pipeline', wait: false
+                script {
+                    def tagName = "minideb-${params.DEBIAN_VERSION}-${BUILD_DATE.replaceAll(':', '-')}"
+                    
+                    sh """
+                        git tag -a ${tagName} -m "Minideb ${params.DEBIAN_VERSION} - ${BUILD_DATE}"
+                        git push origin ${tagName} || echo "Tag already exists or push failed"
+                    """
+                }
             }
         }
     }
@@ -177,10 +273,23 @@ spec:
             }
         }
         success {
-            echo "Minideb ${params.DEBIAN_VERSION} built and published successfully"
+            script {
+                if (env.SKIP_BUILD == 'true' && params.FORCE_BUILD == false) {
+                    echo "Minideb ${params.DEBIAN_VERSION} already up-to-date, no build needed"
+                } else {
+                    echo "Minideb ${params.DEBIAN_VERSION} built and published successfully"
+                    echo "Images available:"
+                    echo "  - ${IMAGE_NAME}:${params.DEBIAN_VERSION}"
+                    echo "  - ${IMAGE_NAME}:${params.DEBIAN_RELEASE}"
+                    echo "  - ${IMAGE_NAME}:latest"
+                }
+            }
         }
         failure {
-            echo "Minideb build failed"
+            echo "Minideb pipeline failed"
+        }
+        unstable {
+            echo "Minideb pipeline unstable - check security scan results"
         }
     }
 }
