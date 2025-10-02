@@ -3,16 +3,6 @@
  * VCNNGR Minideb Pipeline
  * 
  * Build base image Debian minimal con ultime patch di sicurezza
- * 
- * Trigger: 
- * - Manual
- * - Scheduled (weekly)
- * - Webhook da Debian security announce
- * 
- * Output:
- * - vcnngr/minideb:bookworm
- * - vcnngr/minideb:12
- * - vcnngr/minideb:latest
  */
 
 pipeline {
@@ -33,11 +23,16 @@ spec:
     volumeMounts:
     - name: docker-storage
       mountPath: /var/lib/docker
+    - name: shared-data
+      mountPath: /shared
   - name: trivy
     image: aquasec/trivy:latest
     command:
     - cat
     tty: true
+    volumeMounts:
+    - name: shared-data
+      mountPath: /shared
   - name: tools
     image: alpine:latest
     command:
@@ -45,6 +40,8 @@ spec:
     tty: true
   volumes:
   - name: docker-storage
+    emptyDir: {}
+  - name: shared-data
     emptyDir: {}
 """
         }
@@ -164,6 +161,10 @@ spec:
                             
                             echo "Build completed successfully"
                             docker images | grep minideb
+                            
+                            echo "Saving image as tar for scanning..."
+                            docker save ${IMAGE_NAME}:${params.DEBIAN_VERSION} -o /shared/minideb-image.tar
+                            echo "Image saved to /shared/minideb-image.tar"
                         """
                     }
                 }
@@ -183,20 +184,44 @@ spec:
                         echo "Running security scan with Trivy..."
                         
                         sh """
+                            echo "Scanning image from tar archive..."
+                            
+                            # Scan for vulnerabilities
                             trivy image \
+                                --input /shared/minideb-image.tar \
                                 --severity HIGH,CRITICAL \
                                 --exit-code 0 \
                                 --format json \
-                                --output minideb-scan.json \
-                                ${IMAGE_NAME}:${params.DEBIAN_VERSION}
+                                --output minideb-scan.json
                             
+                            # Generate human-readable report
                             trivy image \
+                                --input /shared/minideb-image.tar \
                                 --severity HIGH,CRITICAL,MEDIUM,LOW \
-                                --format table \
-                                ${IMAGE_NAME}:${params.DEBIAN_VERSION} | tee minideb-scan.txt
+                                --format table | tee minideb-scan.txt
                         """
                         
                         archiveArtifacts artifacts: 'minideb-scan.*', allowEmptyArchive: true
+                        
+                        // Parse scan results
+                        def scanResult = readJSON file: 'minideb-scan.json'
+                        if (scanResult.Results) {
+                            def criticalCount = 0
+                            def highCount = 0
+                            scanResult.Results.each { result ->
+                                result.Vulnerabilities?.each { vuln ->
+                                    if (vuln.Severity == 'CRITICAL') criticalCount++
+                                    if (vuln.Severity == 'HIGH') highCount++
+                                }
+                            }
+                            echo "Security Scan Summary:"
+                            echo "  - CRITICAL: ${criticalCount}"
+                            echo "  - HIGH: ${highCount}"
+                            
+                            if (criticalCount > 0) {
+                                unstable("Found ${criticalCount} CRITICAL vulnerabilities")
+                            }
+                        }
                     }
                 }
             }
@@ -218,7 +243,7 @@ spec:
                                 which gosu || exit 1
                                 which curl || exit 1
                                 apt-get update > /dev/null
-                                echo "All tests passed"
+                                echo "All tests passed ✓"
                             '
                         """
                     }
@@ -248,7 +273,7 @@ spec:
                             docker push ${IMAGE_NAME}:${params.DEBIAN_RELEASE}
                             docker push ${IMAGE_NAME}:latest
                             
-                            echo "Images pushed successfully"
+                            echo "Images pushed successfully ✓"
                             
                             docker logout
                         """
@@ -291,9 +316,9 @@ spec:
         success {
             script {
                 if (env.SKIP_BUILD == 'true' && params.FORCE_BUILD == false) {
-                    echo "Minideb ${params.DEBIAN_VERSION} already up-to-date, no build needed"
+                    echo "✓ Minideb ${params.DEBIAN_VERSION} already up-to-date, no build needed"
                 } else {
-                    echo "Minideb ${params.DEBIAN_VERSION} built and published successfully"
+                    echo "✓ Minideb ${params.DEBIAN_VERSION} built and published successfully"
                     echo "Images available:"
                     echo "  - ${IMAGE_NAME}:${params.DEBIAN_VERSION}"
                     echo "  - ${IMAGE_NAME}:${params.DEBIAN_RELEASE}"
@@ -302,10 +327,10 @@ spec:
             }
         }
         failure {
-            echo "Minideb pipeline failed"
+            echo "✗ Minideb pipeline failed"
         }
         unstable {
-            echo "Minideb pipeline unstable - check security scan results"
+            echo "⚠ Minideb pipeline unstable - check security scan results"
         }
     }
 }
