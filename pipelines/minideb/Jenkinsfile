@@ -38,6 +38,11 @@ spec:
     command:
     - cat
     tty: true
+  - name: tools
+    image: alpine:latest
+    command:
+    - cat
+    tty: true
   volumes:
   - name: docker-storage
     emptyDir: {}
@@ -74,16 +79,36 @@ spec:
             }
         }
         
+        stage('Verify Structure') {
+            steps {
+                script {
+                    echo "Verifying repository structure..."
+                    sh '''
+                        echo "Current directory: $(pwd)"
+                        echo "Repository contents:"
+                        ls -la
+                        echo "\nChecking for docker/minideb directory:"
+                        ls -la docker/ || echo "docker/ not found"
+                        ls -la docker/minideb/ || echo "docker/minideb/ not found"
+                        echo "\nChecking for Dockerfile:"
+                        test -f docker/minideb/Dockerfile && echo "✓ Dockerfile found" || echo "✗ Dockerfile NOT found"
+                        echo "\nChecking for install_packages script:"
+                        test -f docker/minideb/rootfs/usr/sbin/install_packages && echo "✓ install_packages found" || echo "✗ install_packages NOT found"
+                    '''
+                }
+            }
+        }
+        
         stage('Check Existing Image') {
             when {
                 expression { params.FORCE_BUILD == false }
             }
             steps {
-                container('docker') {
+                container('tools') {
                     script {
                         echo "Checking if image ${IMAGE_NAME}:${params.DEBIAN_VERSION} exists on Docker Hub..."
                         
-                        sh 'timeout 30 sh -c "until docker info; do sleep 1; done"'
+                        sh 'apk add --no-cache curl'
                         
                         def imageExists = sh(
                             returnStatus: true,
@@ -115,9 +140,12 @@ spec:
                     script {
                         echo "Building VCNNGR Minideb ${params.DEBIAN_VERSION} with latest security patches"
                         
+                        sh 'timeout 30 sh -c "until docker info; do sleep 1; done"'
+                        
                         sh """
                             cd docker/minideb
                             
+                            echo "Building image..."
                             docker build \
                                 --no-cache \
                                 --pull \
@@ -130,7 +158,7 @@ spec:
                                 --label "org.opencontainers.image.title=minideb" \
                                 --label "org.opencontainers.image.description=Minimal Debian base image by VCNNGR" \
                                 --label "org.opencontainers.image.vendor=VCNNGR" \
-                                --label "org.opencontainers.image.source=https://github.com/vcnngr/" \
+                                --label "org.opencontainers.image.source=https://github.com/vcnngr/jenkins" \
                                 --label "org.opencontainers.image.licenses=MIT" \
                                 .
                             
@@ -155,7 +183,6 @@ spec:
                         echo "Running security scan with Trivy..."
                         
                         sh """
-                            # Scan for vulnerabilities
                             trivy image \
                                 --severity HIGH,CRITICAL \
                                 --exit-code 0 \
@@ -163,7 +190,6 @@ spec:
                                 --output minideb-scan.json \
                                 ${IMAGE_NAME}:${params.DEBIAN_VERSION}
                             
-                            # Generate human-readable report
                             trivy image \
                                 --severity HIGH,CRITICAL,MEDIUM,LOW \
                                 --format table \
@@ -171,16 +197,6 @@ spec:
                         """
                         
                         archiveArtifacts artifacts: 'minideb-scan.*', allowEmptyArchive: true
-                        
-                        // Parse scan results
-                        def scanResult = readJSON file: 'minideb-scan.json'
-                        if (scanResult.Results) {
-                            def vulnCount = 0
-                            scanResult.Results.each { result ->
-                                vulnCount += result.Vulnerabilities?.size() ?: 0
-                            }
-                            echo "Found ${vulnCount} total vulnerabilities"
-                        }
                     }
                 }
             }
@@ -196,7 +212,6 @@ spec:
                         echo "Testing minideb image..."
                         
                         sh """
-                            # Test basic functionality
                             docker run --rm ${IMAGE_NAME}:${params.DEBIAN_VERSION} bash -c '
                                 echo "Testing minideb image..."
                                 which install_packages || exit 1
@@ -229,7 +244,6 @@ spec:
                         sh """
                             echo \$DOCKERHUB_CREDENTIALS_PSW | docker login -u \$DOCKERHUB_CREDENTIALS_USR --password-stdin
                             
-                            # Push all tags
                             docker push ${IMAGE_NAME}:${params.DEBIAN_VERSION}
                             docker push ${IMAGE_NAME}:${params.DEBIAN_RELEASE}
                             docker push ${IMAGE_NAME}:latest
@@ -258,7 +272,9 @@ spec:
                     def tagName = "minideb-${params.DEBIAN_VERSION}-${BUILD_DATE.replaceAll(':', '-')}"
                     
                     sh """
-                        git tag -a ${tagName} -m "Minideb ${params.DEBIAN_VERSION} - ${BUILD_DATE}"
+                        git config user.email "jenkins@vcnngr.local"
+                        git config user.name "Jenkins CI"
+                        git tag -a ${tagName} -m "Minideb ${params.DEBIAN_VERSION} - ${BUILD_DATE}" || true
                         git push origin ${tagName} || echo "Tag already exists or push failed"
                     """
                 }
